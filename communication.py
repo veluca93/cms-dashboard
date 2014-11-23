@@ -6,74 +6,78 @@ import select
 import traceback
 import threading
 
+#TODO: crypt with AES or something similar
+
 class Communication(object):
     def __init__(self, addr, port, handler):
         self.port = port
         self.handler = handler
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setblocking(0)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind((socket.gethostbyname(addr), port))
         self.server_socket.listen(5)
-        self.received = dict()
-        self.addr = dict()
-        self.msgid = 0
-        self.msgid_lock = threading.Lock() # Lock for operations on msgid
+
+    def __send(self, data, skt):
+        skt.sendall(json.dumps(data))
+
+    def __recv(self, skt):
+        data = skt.makefile().readline()
+        data = json.loads(data)
+        return data
+
+    def run_in_thread(self, fun, args):
+        t = threading.Thread(target=fun, args=args)
+        t.daemon = True
+        t.run()
 
     def send(self, data, addr, port=None):
         if port is None:
             port = self.port
-        skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-        self.msgid_lock.acquire(True)
-        data["__msgid"] = self.msgid
-        self.msgid += 1
-        self.msgid_lock.release()
+        def real_send(data, addr, port):
+            skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            status = skt.connect((socket.gethostbyname(addr), port))
+            self.__send(data, skt)
+            self.answer(skt)
 
-        status = skt.connect((socket.gethostbyname(addr), port))
-        skt.sendall(json.dumps(data))
+        self.run_in_thread(real_send, (data, addr, port))
 
-    def answer(self, data, addr):
-        try:
-            answer = self.handler(data, addr)
-            if answer is not None:
-                self.send(answer, addr[0])
-        except:
-            traceback.print_exc()
+    def answer(self, skt):
+        while(True):
+            try:
+                #TODO: timeouts?
+                try:
+                    addr = skt.getpeername()
+                    data = self.__recv(skt)
+                except:
+                    if addr is not None:
+                        print "Invalid data from", addr
+                        raise
+                if data is not None:
+                    answer = self.handler(data, addr)
+                else:
+                    answer = (None, False)
+                if answer[0] is not None:
+                    self.__send(answer, skt)
+                if answer[1] is False:
+                    skt.close()
+                    break
+            except:
+                traceback.print_exc()
+                self.__send({"action": "error", "msg": "invalidrequest"}, skt)
+                skt.close()
+                return
 
     def run(self):
         self.handler.start(self)
         while True:
             try:
-                print "Starting select...", [self.server_socket] + self.received.keys(), self.received.keys()
-                skt_in, skt_out, skt_err = select.select([self.server_socket] + self.received.keys(), [], self.received.keys(), 10)
-                print "Ending select...", skt_in, skt_out, skt_err
-                print "Handling errors"
-                for s in skt_err:
-                    if s in self.to_send:
-                        s.close()
-                        del self.to_send[s]
-                    if s in self.received:
-                        s.close()
-                        del self.received[s]
-                print "Handling input"
-                for s in skt_in:
-                    if s is self.server_socket:
-                        skt, client_addr = s.accept()
-                        skt.setblocking(0)
-                        self.received[skt] = []
-                        self.addr[skt] = client_addr
-                    else:
-                        data = s.recv(4096)
-                        if data:
-                            self.received[s] = [data]
-                        else:
-                            t = threading.Thread(target=self.answer, args=(json.loads(''.join(self.received[s])), self.addr[s]))
-                            t.daemon = True
-                            t.start()
-                            s.close()
-                            del self.received[s]
-                            del self.addr[s]
+                s = self.server_socket.accept()
+                print "New connection from", s[1]
+                self.run_in_thread(self.answer, [s[0]])
             except KeyboardInterrupt:
-                return 0
+                break
             except:
                 traceback.print_exc()
+        self.server_socket.shutdown(socket.SHUT_RDWR)
+        self.server_socket.close()
